@@ -1,5 +1,5 @@
 name: WB Chat Bot
-
+//пинаю код или типа того
 on:
   workflow_dispatch:
     inputs:
