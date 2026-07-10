@@ -14,9 +14,6 @@ on:
           - "true"
           - "false"
 
-  schedule:
-    - cron: "3-59/5 * * * *"
-
 # Нужно для того, чтобы workflow мог закоммитить обновлённый state.json обратно в репозиторий
 permissions:
   contents: write
