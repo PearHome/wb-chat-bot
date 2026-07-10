@@ -3,39 +3,25 @@
  * сообщение и покупатель на него НЕ ответил (сообщение продавца - последнее
  * в чате), и отправляет туда ещё одно сообщение.
  *
- * Требования: Node.js 18+ (встроенный fetch, доп. пакеты не нужны)
  * Запуск: node wb_chat_bot.js
- *
- * ВАЖНО:
- * - По умолчанию DRY_RUN = true — скрипт только печатает, в какие чаты
- *   отправил бы сообщение, но ничего не шлёт. Проверьте вывод, и только
- *   потом ставьте DRY_RUN = false.
- * - У метода /seller/events нет фильтра по дате, поэтому скрипт вычитывает
- *   ВСЕ события через пагинацию (курсор next) и сам отфильтровывает нужный
- *   период. Есть паузы между запросами (лимит 10 запросов / 10 секунд).
+ * DRY_RUN=true по умолчанию — ничего не отправляет, только показывает план.
  */
-
-// ========================= НАСТРОЙКИ =========================
 
 const API_TOKEN = process.env.WB_API_TOKEN;
 const BASE_URL = "https://buyer-chat-api.wildberries.ru";
 
-// Текст сообщения продавца, которое ищем
 const TARGET_TEXT =
   "Здравствуйте. Вы оставили отзыв с низкой оценкой. " +
   "Давайте обсудим, что не так с товаром. " +
   "Пожалуйста, расскажите подробно: попробую решить проблему";
 
-// За сколько последних дней проверяем чаты
-const DAYS_BACK = 3;
+const DAYS_BACK = 1;
 
-// Текст нового сообщения, которое нужно отправить 
-const NEW_MESSAGE_TEXT = "Данное сообщение отправлено автоматически. Пожалуйста, не отвечайте на него. Если Вы считаете, что получили сообщение по ошибке, просто удалите или проигнорируйте его.";
+const NEW_MESSAGE_TEXT =
+  "Данное сообщение отправлено автоматически. Пожалуйста, не отвечайте на него. " +
+  "Если Вы считаете, что получили сообщение по ошибке, просто удалите или проигнорируйте его.";
 
-// Пока true — ничего реально не отправляет, только показывает план действий
 const DRY_RUN = true;
-
-// =================================================================
 
 const HEADERS = { Authorization: API_TOKEN };
 
@@ -43,15 +29,23 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function nowStr() {
+  return new Date().toISOString().split("T")[1].split(".")[0]; // HH:MM:SS
+}
+
+function log(msg) {
+  console.log(`[${nowStr()}] ${msg}`);
+}
+
 async function getAllEvents() {
   const events = [];
   let nextCursor = null;
+  let page = 0;
 
   while (true) {
+    page += 1;
     const url = new URL(`${BASE_URL}/api/v1/seller/events`);
-    if (nextCursor !== null) {
-      url.searchParams.set("next", nextCursor);
-    }
+    if (nextCursor !== null) url.searchParams.set("next", nextCursor);
 
     const resp = await fetch(url, { headers: HEADERS });
     if (!resp.ok) {
@@ -66,14 +60,11 @@ async function getAllEvents() {
     const total = result.totalEvents || 0;
     nextCursor = result.next;
 
-    console.log(`Получено событий: ${batch.length} (всего накоплено: ${events.length})`);
+    log(`Страница ${page}: получено ${batch.length} событий (накоплено: ${events.length})`);
 
-    if (total === 0 || batch.length === 0) {
-      break;
-    }
+    if (total === 0 || batch.length === 0) break;
 
-    // Уважаем лимит 10 запросов / 10 секунд
-    await sleep(1100);
+    await sleep(1100); // лимит 10 запросов / 10 секунд
   }
 
   return events;
@@ -88,9 +79,8 @@ function groupByChat(events) {
   const chats = {};
   for (const e of events) {
     if (e.eventType !== "message") continue;
-    const chatId = e.chatID;
-    if (!chats[chatId]) chats[chatId] = [];
-    chats[chatId].push(e);
+    if (!chats[e.chatID]) chats[e.chatID] = [];
+    chats[e.chatID].push(e);
   }
   for (const chatId of Object.keys(chats)) {
     chats[chatId].sort((a, b) => (a.addTimestamp || 0) - (b.addTimestamp || 0));
@@ -99,9 +89,8 @@ function groupByChat(events) {
 }
 
 function findTargets(chatsEvents) {
-  // Возвращает список чатов, где:
-  // - есть сообщение продавца с TARGET_TEXT
-  // - это сообщение последнее в чате (после него ничего нет, в т.ч. ответа покупателя)
+  // Подходит чат, если последнее сообщение в нём — от продавца и совпадает
+  // с TARGET_TEXT (значит, покупатель после этого ничего не ответил).
   const targets = [];
 
   for (const [chatId, msgs] of Object.entries(chatsEvents)) {
@@ -115,12 +104,19 @@ function findTargets(chatsEvents) {
       targets.push({
         chatId,
         replySign: last.replySign,
-        clientName: last.clientName || "",
+        clientName: last.clientName || "без имени",
+        sentAgo: Date.now() - (last.addTimestamp || 0),
       });
     }
   }
 
   return targets;
+}
+
+function formatAgo(ms) {
+  const hours = Math.floor(ms / 1000 / 60 / 60);
+  const minutes = Math.floor((ms / 1000 / 60) % 60);
+  return `${hours}ч ${minutes}м назад`;
 }
 
 async function sendMessage(replySign, text) {
@@ -142,48 +138,53 @@ async function sendMessage(replySign, text) {
 }
 
 async function main() {
-  console.log("Скачиваю события чатов...");
-  const events = await getAllEvents();
+  const startedAt = Date.now();
+  log(`Старт проверки. Период: последние ${DAYS_BACK} сутки. Режим: ${DRY_RUN ? "DRY_RUN" : "БОЕВОЙ"}`);
 
-  console.log(`Фильтрую события за последние ${DAYS_BACK} дн...`);
+  const events = await getAllEvents();
   const recent = filterRecent(events, DAYS_BACK);
-  console.log(`Событий за период: ${recent.length}`);
+  log(`Событий за период: ${recent.length} из ${events.length} всего`);
 
   const chatsEvents = groupByChat(recent);
-  console.log(`Чатов за период: ${Object.keys(chatsEvents).length}`);
+  log(`Активных чатов за период: ${Object.keys(chatsEvents).length}`);
 
   const targets = findTargets(chatsEvents);
-  console.log(`\nНайдено чатов, подходящих под условие: ${targets.length}`);
+  log(`Подходят под условие (нет ответа покупателя): ${targets.length}`);
 
-  for (const { chatId, clientName } of targets) {
-    console.log(` - chatID=${chatId}, покупатель=${clientName}`);
+  for (const { chatId, clientName, sentAgo } of targets) {
+    log(` - ${clientName}, чат ${chatId}, наше сообщение отправлено ${formatAgo(sentAgo)}`);
   }
 
   if (DRY_RUN) {
-    console.log(
-      "\nDRY_RUN=true — сообщения НЕ отправлены. " +
-        "Проверьте список выше и поставьте DRY_RUN=false для реальной отправки."
-    );
+    log("DRY_RUN=true — сообщения не отправлены. Поставьте DRY_RUN=false для реальной отправки.");
     return;
   }
 
-  console.log("\nОтправляю сообщения...");
+  let sent = 0;
+  let failed = 0;
+
   for (const { chatId, replySign, clientName } of targets) {
     if (!replySign) {
-      console.log(` ! Нет replySign для чата ${chatId}, пропуск`);
+      log(` ! Нет replySign для чата ${chatId} (${clientName}), пропуск`);
+      failed += 1;
       continue;
     }
     try {
-      const result = await sendMessage(replySign, NEW_MESSAGE_TEXT);
-      console.log(` + Отправлено в чат ${chatId} (${clientName}):`, result);
+      await sendMessage(replySign, NEW_MESSAGE_TEXT);
+      log(` + Отправлено: ${clientName} (чат ${chatId})`);
+      sent += 1;
     } catch (err) {
-      console.log(` ! Ошибка при отправке в чат ${chatId}: ${err.message}`);
+      log(` ! Ошибка отправки в чат ${chatId} (${clientName}): ${err.message}`);
+      failed += 1;
     }
-    await sleep(1100); // уважаем лимит запросов
+    await sleep(1100);
   }
+
+  const durationSec = ((Date.now() - startedAt) / 1000).toFixed(1);
+  log(`Готово за ${durationSec}с. Отправлено: ${sent}, ошибок: ${failed}`);
 }
 
 main().catch((err) => {
-  console.error("Критическая ошибка:", err);
+  console.error(`[${nowStr()}] Критическая ошибка:`, err);
   process.exit(1);
 });
