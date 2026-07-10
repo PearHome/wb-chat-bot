@@ -17,7 +17,7 @@
 
 // ========================= НАСТРОЙКИ =========================
 
-const API_TOKEN = "ВСТАВЬТЕ_СЮДА_ВАШ_ТОКЕН"; // WB Partners -> Настройки -> Доступ к API
+const API_TOKEN = process.env.WB_API_TOKEN;
 const BASE_URL = "https://buyer-chat-api.wildberries.ru";
 
 // Текст сообщения продавца, которое ищем
