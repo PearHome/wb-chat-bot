@@ -5,10 +5,28 @@
  *
  * Запуск: node wb_chat_bot.js
  * DRY_RUN=true по умолчанию — ничего не отправляет, только показывает план.
+ *
+ * ПЕРСИСТЕНТНЫЙ КУРСОР:
+ * У /seller/events нет официального фильтра по дате — только курсор next.
+ * Курсор сохраняется в STATE_FILE между запусками, чтобы не перечитывать
+ * всю историю каждый раз.
+ *
+ * "ПОСЕВ" СТАРТОВОГО КУРСОРА (экспериментально):
+ * По наблюдениям сообщества, next — это unix-timestamp в мс, и в него можно
+ * подставить произвольное значение, а не только то, что вернул сам WB.
+ * Поэтому при самом первом запуске (файла состояния ещё нет) вместо полного
+ * прохода по истории с начала времён скрипт стартует сразу с отметки
+ * "SEED_DAYS_BACK суток назад". Это НЕ задокументированное официально
+ * поведение — после первого запуска смотрите в лог блок "ПРОВЕРКА ПОСЕВА"
+ * и убедитесь, что даты полученных событий близки к ожидаемым, а не из
+ * глубокой истории. Если проверка не сходится — уберите посев (см. ниже).
  */
+
+const fs = require("fs");
 
 const API_TOKEN = process.env.WB_API_TOKEN;
 const BASE_URL = "https://buyer-chat-api.wildberries.ru";
+const STATE_FILE = process.env.STATE_FILE || "state.json";
 
 const TARGET_TEXT =
   "Здравствуйте. Вы оставили отзыв с низкой оценкой. " +
@@ -17,11 +35,19 @@ const TARGET_TEXT =
 
 const DAYS_BACK = 1;
 
+// На сколько суток назад "сеять" курсор при самом первом запуске.
+// Поставьте null, чтобы отключить посев и всегда идти с самого начала истории.
+const SEED_DAYS_BACK = 1;
+
 const NEW_MESSAGE_TEXT =
   "Данное сообщение отправлено автоматически. Пожалуйста, не отвечайте на него. " +
   "Если Вы считаете, что получили сообщение по ошибке, просто удалите или проигнорируйте его.";
 
 const DRY_RUN = true;
+
+// Предохранитель от зависаний: если вдруг посев не сработал и пошёл полный
+// проход по истории, не даём скрипту работать бесконечно.
+const MAX_PAGES = 2000;
 
 const HEADERS = { Authorization: API_TOKEN };
 
@@ -37,13 +63,45 @@ function log(msg) {
   console.log(`[${nowStr()}] ${msg}`);
 }
 
-async function getAllEvents() {
+function loadState() {
+  if (!fs.existsSync(STATE_FILE)) {
+    if (SEED_DAYS_BACK !== null) {
+      const seedCursor = String(Date.now() - SEED_DAYS_BACK * 24 * 60 * 60 * 1000);
+      log(`Файла состояния нет — первый запуск. Сею курсор на ${SEED_DAYS_BACK} сут. назад: ${seedCursor} (экспериментально, будет проверка ниже)`);
+      return { cursor: seedCursor, seeded: true };
+    }
+    log(`Файла состояния нет — первый запуск, посев отключён, идём с самого начала истории`);
+    return { cursor: null, seeded: false };
+  }
+  try {
+    const raw = fs.readFileSync(STATE_FILE, "utf-8");
+    const state = JSON.parse(raw);
+    log(`Загружен сохранённый курсор: ${state.cursor}`);
+    return state;
+  } catch (err) {
+    log(`Не удалось прочитать ${STATE_FILE} (${err.message}), стартуем заново`);
+    return { cursor: null, seeded: false };
+  }
+}
+
+function saveState(state) {
+  fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
+  log(`Курсор сохранён в ${STATE_FILE}: ${state.cursor}`);
+}
+
+async function getNewEvents(startCursor) {
   const events = [];
-  let nextCursor = null;
+  let nextCursor = startCursor;
   let page = 0;
 
   while (true) {
     page += 1;
+
+    if (page > MAX_PAGES) {
+      log(`! Достигнут предохранитель MAX_PAGES=${MAX_PAGES}. Останавливаюсь досрочно, сохраню то, что есть.`);
+      break;
+    }
+
     const url = new URL(`${BASE_URL}/api/v1/seller/events`);
     if (nextCursor !== null) url.searchParams.set("next", nextCursor);
 
@@ -58,16 +116,48 @@ async function getAllEvents() {
     events.push(...batch);
 
     const total = result.totalEvents || 0;
-    nextCursor = result.next;
+    nextCursor = result.next ?? nextCursor;
 
-    log(`Страница ${page}: получено ${batch.length} событий (накоплено: ${events.length})`);
+    if (page === 1 || page % 20 === 0 || total === 0) {
+      log(`Страница ${page}: получено ${batch.length} событий (накоплено: ${events.length})`);
+    }
 
     if (total === 0 || batch.length === 0) break;
 
     await sleep(1100); // лимит 10 запросов / 10 секунд
   }
 
-  return events;
+  return { events, lastCursor: nextCursor };
+}
+
+function checkSeed(events, seedCursorMs) {
+  // Сверяем, действительно ли посев сработал: даты первых полученных событий
+  // должны быть близки к ожидаемой точке отсчёта, а не из глубокой истории.
+  if (events.length === 0) {
+    log("ПРОВЕРКА ПОСЕВА: событий не получено, сверить не с чем — само по себе не ошибка");
+    return;
+  }
+
+  const timestamps = events.map((e) => e.addTimestamp || 0).filter(Boolean);
+  if (timestamps.length === 0) {
+    log("ПРОВЕРКА ПОСЕВА: не удалось прочитать даты событий, пропускаю проверку");
+    return;
+  }
+
+  const oldest = Math.min(...timestamps);
+  const diffHours = (oldest - seedCursorMs) / 1000 / 60 / 60;
+
+  log(`ПРОВЕРКА ПОСЕВА: самое старое полученное событие — ${new Date(oldest).toISOString()}`);
+
+  if (diffHours < -6) {
+    log(
+      `! ПОСЕВ, ПОХОЖЕ, НЕ СРАБОТАЛ: получены события заметно старше точки посева ` +
+        `(${new Date(seedCursorMs).toISOString()}). Возможно, WB игнорирует произвольный next. ` +
+        `Рекомендация: поставьте SEED_DAYS_BACK = null и удалите state.json, чтобы честно пройти всю историю один раз.`
+    );
+  } else {
+    log("Посев выглядит корректным — события начинаются примерно с ожидаемой точки.");
+  }
 }
 
 function filterRecent(events, daysBack) {
@@ -139,11 +229,18 @@ async function sendMessage(replySign, text) {
 
 async function main() {
   const startedAt = Date.now();
-  log(`Старт проверки. Период: последние ${DAYS_BACK} сутки. Режим: ${DRY_RUN ? "DRY_RUN" : "БОЕВОЙ"}`);
+  log(`Старт проверки. Режим: ${DRY_RUN ? "DRY_RUN" : "БОЕВОЙ"}`);
 
-  const events = await getAllEvents();
+  const state = loadState();
+  const { events, lastCursor } = await getNewEvents(state.cursor);
+  log(`Всего новых событий с прошлого запуска: ${events.length}`);
+
+  if (state.seeded) {
+    checkSeed(events, Number(state.cursor));
+  }
+
   const recent = filterRecent(events, DAYS_BACK);
-  log(`Событий за период: ${recent.length} из ${events.length} всего`);
+  log(`Из них за последние ${DAYS_BACK} сутки: ${recent.length}`);
 
   const chatsEvents = groupByChat(recent);
   log(`Активных чатов за период: ${Object.keys(chatsEvents).length}`);
@@ -157,31 +254,34 @@ async function main() {
 
   if (DRY_RUN) {
     log("DRY_RUN=true — сообщения не отправлены. Поставьте DRY_RUN=false для реальной отправки.");
-    return;
+  } else {
+    let sent = 0;
+    let failed = 0;
+
+    for (const { chatId, replySign, clientName } of targets) {
+      if (!replySign) {
+        log(` ! Нет replySign для чата ${chatId} (${clientName}), пропуск`);
+        failed += 1;
+        continue;
+      }
+      try {
+        await sendMessage(replySign, NEW_MESSAGE_TEXT);
+        log(` + Отправлено: ${clientName} (чат ${chatId})`);
+        sent += 1;
+      } catch (err) {
+        log(` ! Ошибка отправки в чат ${chatId} (${clientName}): ${err.message}`);
+        failed += 1;
+      }
+      await sleep(1100);
+    }
+
+    log(`Отправлено: ${sent}, ошибок: ${failed}`);
   }
 
-  let sent = 0;
-  let failed = 0;
-
-  for (const { chatId, replySign, clientName } of targets) {
-    if (!replySign) {
-      log(` ! Нет replySign для чата ${chatId} (${clientName}), пропуск`);
-      failed += 1;
-      continue;
-    }
-    try {
-      await sendMessage(replySign, NEW_MESSAGE_TEXT);
-      log(` + Отправлено: ${clientName} (чат ${chatId})`);
-      sent += 1;
-    } catch (err) {
-      log(` ! Ошибка отправки в чат ${chatId} (${clientName}): ${err.message}`);
-      failed += 1;
-    }
-    await sleep(1100);
-  }
+  saveState({ cursor: lastCursor, updatedAt: new Date().toISOString() });
 
   const durationSec = ((Date.now() - startedAt) / 1000).toFixed(1);
-  log(`Готово за ${durationSec}с. Отправлено: ${sent}, ошибок: ${failed}`);
+  log(`Готово за ${durationSec}с.`);
 }
 
 main().catch((err) => {
