@@ -1,5 +1,7 @@
 name: WB Chat Bot
-//пинаю код или типа того
+
+# Пересинхронизация расписания (issue на стороне GitHub, январь 2026)
+
 on:
   workflow_dispatch:
     inputs:
@@ -35,7 +37,7 @@ jobs:
         env:
           WB_API_TOKEN: ${{ secrets.WB_API_TOKEN }}
           NEW_MESSAGE_TEXT: ${{ secrets.NEW_MESSAGE_TEXT }}
-          DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
+          DRY_RUN: "false"
         run: node wb_chat_bot.js
 
       - name: Commit updated state.json
