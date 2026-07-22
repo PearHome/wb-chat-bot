@@ -10,7 +10,7 @@ crons = ["*/5 * * * *"]
 # id подставится после команды: wrangler kv namespace create WB_STATE
 [[kv_namespaces]]
 binding = "WB_STATE"
-id = "ВСТАВЬТЕ_СЮДА_ID_ПОСЛЕ_СОЗДАНИЯ"
+id = "874a9e40ccfc45358d753a911dc8210e"
 
 # Обычная (не секретная) переменная — можно временно поставить "true" для проверки
 [vars]
