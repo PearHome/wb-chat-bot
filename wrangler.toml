@@ -1,0 +1,17 @@
+name = "wb-chat-bot"
+main = "src/index.js"
+compatibility_date = "2026-07-01"
+
+# Расписание — каждые 5 минут, без внешних сервисов и без GitHub
+[triggers]
+crons = ["*/5 * * * *"]
+
+# KV-хранилище для сохранения курсора между запусками.
+# id подставится после команды: wrangler kv namespace create WB_STATE
+[[kv_namespaces]]
+binding = "WB_STATE"
+id = "ВСТАВЬТЕ_СЮДА_ID_ПОСЛЕ_СОЗДАНИЯ"
+
+# Обычная (не секретная) переменная — можно временно поставить "true" для проверки
+[vars]
+DRY_RUN = "false"
